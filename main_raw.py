@@ -169,15 +169,7 @@ def get_baseline(meta):
     return baseline
 
 
-def get_huffmans(meta):
-    info = meta[0]
-    h_class = (info & 0xf0) >> 4
-#     print("Doing " + ("DC" if h_class == 0 else "AC"))
-    h_id = info & 0x0f
-    code_lens = [int(i) for i in meta[1:17]]
-    codes = [int(i) for i in meta[17:]]
-#     print(code_lens)
-#     print(codes)
+def build_tree(code_lens, codes):
     root = LetterNode()
     cur = root
     code_index = 0
@@ -226,13 +218,32 @@ def get_huffmans(meta):
             code_index += 1
 #     pprint(root.dict_repr())
     h = list(dfs(root))
-    return {"class": h_class, "class_repr": "DC" if h_class == 0 else "AC", "id": h_id, "table": h}
+    return h
+
+
+def get_huffmans(meta):
+    int_meta = [int(i) for i in meta]
+    safe_n = 0
+    trees = []
+    while len(int_meta) > 0 and safe_n < 1000:
+        info = int_meta[0]
+        h_class = (info & 0xf0) >> 4
+        h_id = info & 0x0f
+        code_lens = int_meta[1:17]
+        last_index = 17 + sum(code_lens)
+        codes = int_meta[17:last_index]
+        int_meta = int_meta[last_index:]
+        tree = build_tree(code_lens, codes)
+        trees.append({"class": h_class, "class_repr": "DC" if h_class ==
+                      0 else "AC", "id": h_id, "table": tree})
+    return trees
 
 
 def get_scan_info(meta):
     scan_info = {"channels": []}
     scan_info["num_channels"] = meta[0]
-    channels_data_raw = meta[1:1+scan_info["num_channels"]*2]
+    # print(f"num_channels: {meta[0]}")
+    channels_data_raw = meta[1: 1 + scan_info["num_channels"]*2]
     for i in range(scan_info["num_channels"]):
         channel_data = bytes2int(channels_data_raw[i*2:i*2+2])
         channel_id = (channel_data & 0xff_00) >> 2*4
@@ -247,12 +258,14 @@ def get_scan_info(meta):
     return scan_info
 
 
-def get_mat(buffer, reverse_dict_dc, reverse_dict_ac, byte_rest):
+def get_mat(reverse_dict_dc, reverse_dict_ac, byte_rest):
+    assert len(byte_rest) != 0, f"Get mat got byte_rest with zero length"
     mute = True
     Mat = []
     safe_n = 0
 # DC
-    while True and safe_n < 1000:
+    buffer = bitarray.bitarray(endian='big')
+    while True and safe_n < 10000:
         safe_n += 1
         str_repr = buffer.to01()
         if str_repr in reverse_dict_dc:
@@ -279,16 +292,21 @@ def get_mat(buffer, reverse_dict_dc, reverse_dict_ac, byte_rest):
         else:
             buffer += byte_rest[0:1]
             byte_rest = byte_rest[1:]
+    if len(byte_rest) == 0:
+        print("Weird thing in huffman. Byte_rest empty after dc koeff")
+    # print(f"Mat len {len(Mat)}")
 # AC
     safe_n = 0
     while True and safe_n < 1000:
         safe_n += 1
         str_repr = buffer.to01()
         if str_repr in reverse_dict_ac:
+            # first_reset = byte_rest.to01().find('1111111111010000')
+            # print(f"From get mat {first_reset=}")
             value = reverse_dict_ac[str_repr]
             if not mute:
                 print(
-                    f"Found AC koeff in huffman {str_repr} with value {value}")
+                    f"Found AC koeff in huffman {str_repr} with value {value}. Mat len was {len(Mat)}")
             if value == 0:
                 if not mute:
                     print(f"Zero AC koeff. Filling rest with zeros")
@@ -298,16 +316,19 @@ def get_mat(buffer, reverse_dict_dc, reverse_dict_ac, byte_rest):
                 zeros_count = (value & 0xf0) >> 4
                 meaning_len = (value & 0x0f)
                 koeff_str = byte_rest[:meaning_len].to01()
+                assert koeff_str != '', f"koeff_str empty. meaning len {meaning_len}, zeros {zeros_count}"
                 byte_rest = byte_rest[meaning_len:]
                 koeff = int(koeff_str, 2)
                 if koeff_str[0] == '0':
                     koeff = koeff - 2**len(koeff_str) + 1
                 for _ in range(zeros_count):
                     Mat.append(0)
+                    if len(Mat) == 8*8:
+                        break
                 Mat.append(koeff)
                 if not mute:
                     print(
-                        f"AC is non-zero. Reading {meaning_len} bits. Got {zeros_count} zeros and {koeff} meaning. Rest {byte_rest.to01()[:10]}...")
+                        f"AC is non-zero. Reading {meaning_len} bits. Got {zeros_count} zeros and {koeff} meaning. Rest {byte_rest.to01()[:50]}...")
             buffer.clear()
             if len(Mat) == 8*8:
                 if not mute:
@@ -316,6 +337,7 @@ def get_mat(buffer, reverse_dict_dc, reverse_dict_ac, byte_rest):
         else:
             buffer += byte_rest[0:1]
             byte_rest = byte_rest[1:]
+    # print(f"Mat:\n{Mat}\n\n")
     return to_zigzag_order(Mat), byte_rest
 
 
@@ -375,6 +397,7 @@ def process(file_name):
         data_tables_idct = []
         data_tables_rgb = []
         reset_interval = None
+        resest_count = 0
 
         while True and marker != b'':
             marker = f.read(2)
@@ -428,15 +451,40 @@ def process(file_name):
                 print(f"start_of_scan with length {l}")
                 meta = f.read(l - 2)
                 scan_info = get_scan_info(meta)
-                pprint(scan_info)
+                print(f"{scan_info=}")
                 rest = f.read()
                 end_mark = rest[-2:].hex()
+                # print(
+                # f"Reading rest of length {len(rest)}\n\n\n\n\n{rest.hex()}")
                 if end_mark == markers['end']:
                     print("Successfully ended reading file")
-#                 rest = rest[:-2]
+                rest = rest[:-2]
                 # print(rest)
+                filter_stuffing = [rest[i: i+2].hex()
+                                   for i in range(0, len(rest) + 1, 2)]
+                print(
+                    f"Len before pruning {len(''.join(filter_stuffing))/2} bytes")
+                # filter_stuffing = [(i if i != 'ff00' else 'ff')
+                #                    for i in filter_stuffing]
+                # filter_stuffing = ''.join(filter_stuffing)
+                filter_stuffing = ','.join(
+                    filter_stuffing).replace('ff,00', 'ff').replace(',','')
+                filter_stuffing = [filter_stuffing[i:i+2]
+                                   for i in range(0, len(filter_stuffing)+1, 2)]
+                filter_stuffing = [i for i in filter_stuffing if i != '']
+                filter_stuffing = [int(i, base=16).to_bytes(
+                    1, "big") for i in filter_stuffing]
+                filter_stuffing = b''.join(filter_stuffing)
+                print(f"Len afteer pruning {len(filter_stuffing)/2} bytes")
+
+                print(f"{filter_stuffing=}")
                 byte_rest = bitarray.bitarray(endian='big')
-                byte_rest.frombytes(rest)
+                byte_rest.frombytes(filter_stuffing)
+                first_reset = byte_rest.to01().find('1111111111010000')
+                secret_stuffing = len(
+                    byte_rest.to01().split('1111111100000000')) - 1
+                print(f"{first_reset=}")
+                print(f"{secret_stuffing=}")
                 # pprint(byte_rest)
 
                 current_tables_id = 0
@@ -444,42 +492,73 @@ def process(file_name):
                 buffer = bitarray.bitarray(endian='big')
 #                 while True and safe_n < 1000:
 #                     safe_n += 1
+                # print(f"{huffmans}")
                 total_mats_count = 0
                 for b in baseline["channels"]:
                     total_mats_count += b['hor_dwn'] * b['ver_dwn']
                 print(f"{total_mats_count=}")
-                for chan in scan_info["channels"]:
-                    huff_dc = get_huff_table(huffmans, 0, chan["huff_dc"])
-                    huff_ac = get_huff_table(huffmans, 1, chan["huff_ac"])
-                    # print(f"{huff_dc=}\n{huff_ac=}")
-                    reverse_dict_dc = dict([(code, letter)
-                                            for letter, code in huff_dc])
-                    reverse_dict_ac = dict([(code, letter)
-                                            for letter, code in huff_ac])
-                    chan_mat_info = [i for i in baseline["channels"]
-                                     if i['id'] == chan["channel_id"]][0]
-                    chan_mat_count = chan_mat_info['hor_dwn'] * \
-                        chan_mat_info['ver_dwn']
-                    channel_tables = []
-                    channel_tables_quant_mul = []
-                    # pprint(quants)
-                    quant_table = [i for i in quants if i["table_id"]
-                                   == chan_mat_info["quant_id"]][0]["table"]
-                    print(f"{quant_table=}")
-                    for chan_mat in range(chan_mat_count):
-                        Mat, byte_rest = get_mat(
-                            buffer, reverse_dict_dc, reverse_dict_ac, byte_rest)
-                        channel_tables.append(Mat)
-                        # channel_tables_quant_mul.append(
-                        #     mat_mut(Mat, quant_table))
-                        # pprint(Mat)
-                    fix_channel_tables(channel_tables)
-                    for ch_t in channel_tables:
-                        channel_tables_quant_mul.append(
-                            mat_mut(ch_t, quant_table))
-                    data_tables.append(channel_tables)
-                    data_tables_quant_mul.append(channel_tables_quant_mul)
+                safe_n = 0
+                while len(byte_rest) > 7 and safe_n < 400:
+                    if reset_interval is not None:
+                        print(f"{reset_interval=}")
+                        # (safe_n % (reset_interval // 3)) == 0
+                        is_last_in_reset = ((safe_n+1) % (reset_interval)) == 0
+                        print(f"{is_last_in_reset=}")
+                    print(f"byte_rest len {len(byte_rest)}")
+                    safe_n += 1
+                    print(
+                        f"Decoding {safe_n}th Block. Rest: {byte_rest.to01()[:30]}...")
+                    for chan in scan_info["channels"]:
+                        first_reset = byte_rest.to01().find('1111111111010000')
+                        huff_dc = get_huff_table(huffmans, 0, chan["huff_dc"])
+                        huff_ac = get_huff_table(huffmans, 1, chan["huff_ac"])
+                        # print(f"{huff_dc=}\n{huff_ac=}")
+                        reverse_dict_dc = dict([(code, letter)
+                                                for letter, code in huff_dc])
+                        reverse_dict_ac = dict([(code, letter)
+                                                for letter, code in huff_ac])
+                        chan_mat_info = [i for i in baseline["channels"]
+                                         if i['id'] == chan["channel_id"]][0]
+                        chan_mat_count = chan_mat_info['hor_dwn'] * \
+                            chan_mat_info['ver_dwn']
+                        channel_tables = []
+                        channel_tables_quant_mul = []
+                        # pprint(quants)
+                        quant_table = [i for i in quants if i["table_id"]
+                                       == chan_mat_info["quant_id"]][0]["table"]
+                        # print(f"{quant_table=}")
+                        for chan_mat in range(chan_mat_count):
+                            first_reset = byte_rest.to01().find('1111111111010000')
+                            print(f"Before get mat {first_reset=}")
+                            Mat, byte_rest = get_mat(
+                                reverse_dict_dc, reverse_dict_ac, byte_rest)
+                            channel_tables.append(Mat)
+                            # channel_tables_quant_mul.append(
+                            #     mat_mut(Mat, quant_table))
+                            # pprint(Mat)
+                        fix_channel_tables(channel_tables)
+                        for ch_t in channel_tables:
+                            channel_tables_quant_mul.append(
+                                mat_mut(ch_t, quant_table))
+                        data_tables.append(channel_tables)
+                        data_tables_quant_mul.append(channel_tables_quant_mul)
+                    if reset_interval is not None and is_last_in_reset:
+                        index = format(resest_count % 8, '03b')
+                        print(f"Reset index bin: {index}")
+                        resest_count += 1
+                        shift_len = byte_rest.to01().find('1111111111010' + index)
+                        if shift_len == -1:
+                            print(f"Reset marker not fount proceeding further.")
+                        else:
+                            reset_marker = byte_rest[shift_len: shift_len +
+                                                     2*8].tobytes().hex()
+                            print(f"{shift_len=}")
+                            print(f"{reset_marker=}")
+                            print(f"Rest before: {byte_rest[:18]}...")
+                            byte_rest = byte_rest[shift_len + 2*8:]
+                            print(f"Rest after: {byte_rest[:18]}...")
                 # pprint(data_tables_quant_mul)
+                # print(f"{byte_rest=}")
             elif hex_repr == markers['end']:
                 print(f"End of image")
             else:
@@ -488,10 +567,10 @@ def process(file_name):
         # end parse
         # Inverse descrete cosine transform
         print(
-            f"Performing inverse descrete cosine transform for {len(data_tables_quant_mul)} channels")
+            f"Performing inverse descrete cosine transform for {len(data_tables_quant_mul)} blocks*channels")
         one_over_sqrt_2 = 2**(-1/2)
         for chan in data_tables_quant_mul:
-            print(f"Performing idct for {len(chan)} tables in channel")
+            print(f"Performing idct for {len(chan)} tables in channel*block")
             channel_idct_tables = []
             for table in chan:
                 idct_table = copy.deepcopy(table)
@@ -513,33 +592,36 @@ def process(file_name):
                             max(round(s_yx) + 128, 0), 255)
                 channel_idct_tables.append(idct_table)
             data_tables_idct.append(channel_idct_tables)
-        # pprint(data_tables_idct)
+        pprint(data_tables_idct)
         print("Performing RGB conversion")
-        ychan = data_tables_idct[0]
-        print(f"Lume tables count {len(ychan)}")
-        y_chan_size = int(len(ychan)**(1/2))
-        # for row in range(baseline['height']):
-        #     for col in range(baseline['width']):
-        #         index = row * baseline['height'] + col
-        #         Y = ychan[row]
-        for table_id in range(len(ychan)):
-            table = ychan[table_id]
-            # print(f"HUUUUI {table=}")
-            table_rgb = copy.deepcopy(table)
-            for y in range(len(table)):
-                for x in range(len(table[y])):
-                    dwn_y = 4*(table_id // y_chan_size) + (y // 2)
-                    dwn_x = 4*(table_id % y_chan_size) + (x // 2)
-                    R, G, B = YCbCrToRGB(
-                        table[y][x],
-                        data_tables_idct[1][0][dwn_y][dwn_x],
-                        data_tables_idct[2][0][dwn_y][dwn_x]
-                    )
-                    # print(f"{B=}")
-                    table_rgb[x][y] = [R, G, B]
-            data_tables_rgb.append(table_rgb)
+        for channel_block_index in range(0, len(data_tables_idct), 3):
+            ychan = data_tables_idct[channel_block_index]
+            print(f"Lume tables count {len(ychan)}")
+            y_chan_size = 2  # int(len(ychan)**(1/2))
+            # for row in range(baseline['height']):
+            #     for col in range(baseline['width']):
+            #         index = row * baseline['height'] + col
+            #         Y = ychan[row]
+            for table_index in range(len(ychan)):
+                table = ychan[table_index]
+                # print(f"HUUUUI {table=}")
+                table_rgb = copy.deepcopy(table)
+                for y in range(len(table)):
+                    for x in range(len(table[y])):
+                        dwn_y = 4*(table_index // y_chan_size) + (y // 2)
+                        dwn_x = 4*(table_index % y_chan_size) + (x // 2)
+                        R, G, B = YCbCrToRGB(
+                            table[y][x],
+                            data_tables_idct[channel_block_index +
+                                             1][0][dwn_y][dwn_x],
+                            data_tables_idct[channel_block_index +
+                                             2][0][dwn_y][dwn_x]
+                        )
+                        # print(f"{B=}")
+                        table_rgb[x][y] = [R, G, B]
+                data_tables_rgb.append(table_rgb)
         # pprint(data_tables_rgb)
         save_rgb_arr(data_tables_rgb)
 
 
-process('leon.jpeg')
+process('lein.jpeg')
